@@ -98,6 +98,49 @@ class SpyrePlatform(Platform):
         return False
 
     @classmethod
+    def get_spyre_scheduler_cls(
+        cls,
+        scheduler_config,
+        is_pooling: bool,
+    ) -> type:
+        """Get the appropriate Spyre scheduler class.
+        
+        This follows the same pattern as vLLM's upstream SchedulerConfig.get_scheduler_cls():
+        - If scheduler_cls is already set, use it (allows custom schedulers)
+        - Otherwise, select based on model type (pooling vs generative)
+        
+        Note: The scheduler classes can behave as either sync or async based on the
+        VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING environment variable, which is checked
+        at import time in scheduler_impl.py.
+        
+        Args:
+            scheduler_config: The scheduler configuration object
+            is_pooling: True for pooling/embedding models, False for generative models
+            
+        Returns:
+            The scheduler class to use
+        """
+        # If a custom scheduler is explicitly set, use it
+        # This matches upstream's behavior
+        if scheduler_config.scheduler_cls is not None:
+            if not isinstance(scheduler_config.scheduler_cls, str):
+                return scheduler_config.scheduler_cls
+            # We'll let vLLM's resolve_obj_by_qualname handle string resolution later
+            return scheduler_config.scheduler_cls
+        
+        # Select Spyre scheduler based on model type
+        # The scheduler classes in scheduler_impl.py will automatically be sync or async
+        # based on the VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING environment variable
+        if is_pooling:
+            # Pooling/embedding models
+            from vllm_spyre.v1.core.scheduler import PoolingSpyreScheduler
+            return PoolingSpyreScheduler
+        else:
+            # Generative models (decoder-only)
+            from vllm_spyre.v1.core.scheduler import ChunkedPrefillSpyreScheduler
+            return ChunkedPrefillSpyreScheduler
+
+    @classmethod
     def get_max_batch_tkv_limit(cls) -> int:
         if cls._max_batch_tkv_limit == 0:
             # For spawned subprocesses, we need to grab the TKV limit from the environment
@@ -214,9 +257,18 @@ class SpyrePlatform(Platform):
             os.environ["FLEX_DEVICE"] = "COMPILE"
 
         if is_decoder:
-            scheduler_config.scheduler_cls = (
-                "vllm_spyre.v1.core.scheduler.ChunkedPrefillSpyreScheduler"
+            # Select scheduler using get_spyre_scheduler_cls(), following upstream's pattern
+            # This checks scheduler_cls first, then async_scheduling flag
+            scheduler_cls = cls.get_spyre_scheduler_cls(
+                scheduler_config=scheduler_config,
+                is_pooling=False,
             )
+            # Set as string path for vLLM's resolution (matches upstream behavior)
+            # Only convert to string if it's not already a string
+            if not isinstance(scheduler_cls, str):
+                scheduler_config.scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__name__}"
+            else:
+                scheduler_config.scheduler_cls = scheduler_cls
 
             if (
                 vllm_config.model_config.quantization
@@ -244,7 +296,17 @@ class SpyrePlatform(Platform):
             # unsetting this config as it was only set to pass vllm scheduler's max_model_len check
             vllm_config.scheduler_config.enable_chunked_prefill = False
 
-            scheduler_config.scheduler_cls = "vllm_spyre.v1.core.scheduler.PoolingSpyreScheduler"
+            # Select scheduler using get_spyre_scheduler_cls(), following upstream's pattern
+            scheduler_cls = cls.get_spyre_scheduler_cls(
+                scheduler_config=scheduler_config,
+                is_pooling=True,
+            )
+            # Set as string path for vLLM's resolution (matches upstream behavior)
+            # Only convert to string if it's not already a string
+            if not isinstance(scheduler_cls, str):
+                scheduler_config.scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__name__}"
+            else:
+                scheduler_config.scheduler_cls = scheduler_cls
 
         # Apply model-specific configurations using the registry
         # Only when running on Spyre device (sendnn backend)
@@ -280,8 +342,25 @@ class SpyrePlatform(Platform):
                 envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND,
             )
 
-        # TODO: try to support async scheduling
-        scheduler_config.async_scheduling = False
+        # Async scheduling support: Now implemented via AsyncPoolingSpyreScheduler
+        # and AsyncChunkedPrefillSpyreScheduler. However, it is disabled by default
+        # for Spyre to maintain stability. Set to None to allow vLLM's default behavior.
+        if scheduler_config.async_scheduling is None:
+            # Check environment variable for override
+            if envs_spyre.VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING:
+                scheduler_config.async_scheduling = True
+                logger.info(
+                    "Async scheduling enabled via VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING"
+                )
+            else:
+                # Default to False for Spyre for backward compatibility
+                # Users can explicitly enable by setting async_scheduling=True
+                scheduler_config.async_scheduling = False
+        
+        logger.info(
+            "Spyre async scheduling is %s",
+            "enabled" if scheduler_config.async_scheduling else "disabled"
+        )
 
         # To disable any paged attention ops in the base scheduler, we:
         # - Set the block size (in tokens) to the maximum sequence length
