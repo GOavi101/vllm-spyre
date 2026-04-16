@@ -107,11 +107,10 @@ class SpyrePlatform(Platform):
         
         This follows the same pattern as vLLM's upstream SchedulerConfig.get_scheduler_cls():
         - If scheduler_cls is already set, use it (allows custom schedulers)
-        - Otherwise, select based on model type (pooling vs generative)
+        - Otherwise, select based on scheduler_config.async_scheduling and model type
         
-        Note: The scheduler classes can behave as either sync or async based on the
-        VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING environment variable, which is checked
-        at import time in scheduler_impl.py.
+        The scheduler selection uses factory functions that create classes with the
+        appropriate base (Scheduler or AsyncScheduler) based on async_scheduling config.
         
         Args:
             scheduler_config: The scheduler configuration object
@@ -128,17 +127,24 @@ class SpyrePlatform(Platform):
             # We'll let vLLM's resolve_obj_by_qualname handle string resolution later
             return scheduler_config.scheduler_cls
         
-        # Select Spyre scheduler based on model type
-        # The scheduler classes in scheduler_impl.py will automatically be sync or async
-        # based on the VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING environment variable
-        if is_pooling:
-            # Pooling/embedding models
-            from vllm_spyre.v1.core.scheduler import PoolingSpyreScheduler
-            return PoolingSpyreScheduler
+        # Import from appropriate module based on async_scheduling config
+        # These modules have classes created at module level, so they're importable
+        if scheduler_config.async_scheduling:
+            # Use async scheduler variants
+            if is_pooling:
+                from vllm_spyre.v1.core.async_scheduler import AsyncPoolingSpyreScheduler
+                return AsyncPoolingSpyreScheduler
+            else:
+                from vllm_spyre.v1.core.async_scheduler import AsyncChunkedPrefillSpyreScheduler
+                return AsyncChunkedPrefillSpyreScheduler
         else:
-            # Generative models (decoder-only)
-            from vllm_spyre.v1.core.scheduler import ChunkedPrefillSpyreScheduler
-            return ChunkedPrefillSpyreScheduler
+            # Use sync scheduler variants (default)
+            if is_pooling:
+                from vllm_spyre.v1.core.scheduler import PoolingSpyreScheduler
+                return PoolingSpyreScheduler
+            else:
+                from vllm_spyre.v1.core.scheduler import ChunkedPrefillSpyreScheduler
+                return ChunkedPrefillSpyreScheduler
 
     @classmethod
     def get_max_batch_tkv_limit(cls) -> int:
@@ -342,20 +348,12 @@ class SpyrePlatform(Platform):
                 envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND,
             )
 
-        # Async scheduling support: Now implemented via AsyncPoolingSpyreScheduler
-        # and AsyncChunkedPrefillSpyreScheduler. However, it is disabled by default
-        # for Spyre to maintain stability. Set to None to allow vLLM's default behavior.
+        # Async scheduling support: Now implemented via factory functions that create
+        # schedulers with AsyncScheduler base class. Following upstream vLLM pattern,
+        # users control this via --async-scheduling flag or scheduler_config.async_scheduling.
+        # Default to False for Spyre for backward compatibility.
         if scheduler_config.async_scheduling is None:
-            # Check environment variable for override
-            if envs_spyre.VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING:
-                scheduler_config.async_scheduling = True
-                logger.info(
-                    "Async scheduling enabled via VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING"
-                )
-            else:
-                # Default to False for Spyre for backward compatibility
-                # Users can explicitly enable by setting async_scheduling=True
-                scheduler_config.async_scheduling = False
+            scheduler_config.async_scheduling = False
         
         logger.info(
             "Spyre async scheduling is %s",

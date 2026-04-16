@@ -2,6 +2,11 @@
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
+from vllm_spyre.v1.core.scheduler_impl import (
+    _create_chunked_prefill_scheduler,
+    _create_pooling_scheduler,
+)
+
 
 class SpyreScheduler(Scheduler):
     """Base class inheriting from the V1 scheduler to support static
@@ -13,13 +18,20 @@ class SpyreScheduler(Scheduler):
         self.model_config = self.vllm_config.model_config
 
 
-# Import implementation classes from scheduler_impl
-# These classes can inherit from either sync or async base schedulers
-# based on the VLLM_SPYRE_ENABLE_ASYNC_SCHEDULING environment variable
-from vllm_spyre.v1.core.scheduler_impl import (
-    ChunkedPrefillSpyreScheduler,
-    PoolingSpyreScheduler,
-)
+# Default sync schedulers (backward compatibility)
+# Platform.py will override these based on scheduler_config.async_scheduling
+PoolingSpyreScheduler = _create_pooling_scheduler(Scheduler)
+ChunkedPrefillSpyreScheduler = _create_chunked_prefill_scheduler(Scheduler)
+
+# Fix __module__, __name__, and __qualname__ so classes are importable from this module
+# and resolve correctly when converted to string paths
+PoolingSpyreScheduler.__module__ = __name__
+PoolingSpyreScheduler.__name__ = "PoolingSpyreScheduler"
+PoolingSpyreScheduler.__qualname__ = "PoolingSpyreScheduler"
+
+ChunkedPrefillSpyreScheduler.__module__ = __name__
+ChunkedPrefillSpyreScheduler.__name__ = "ChunkedPrefillSpyreScheduler"
+ChunkedPrefillSpyreScheduler.__qualname__ = "ChunkedPrefillSpyreScheduler"
 
 __all__ = [
     "PoolingSpyreScheduler",

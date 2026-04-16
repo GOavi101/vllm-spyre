@@ -1481,14 +1481,16 @@ class ChunkedPrefillModelRunner(
     ) -> ModelRunnerOutput:
         t0 = time.time()
 
+        # Initialize internal request states if this is the first chunk of a very new prefill
+        # IMPORTANT: Must be called BEFORE update_states() to ensure new requests are added
+        # to self.requests before _update_batch() tries to access them (critical for AsyncScheduler)
+        self.maybe_setup_new_prefill(scheduler_output)
+
         self.update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             return self.get_empty_output()
-
-        # Initialize internal request states if this is the first chunk of a very new prefill
-        self.maybe_setup_new_prefill(scheduler_output)
 
         model_input = self.prepare_model_input(scheduler_output)
         is_prefill = model_input.is_prompt
