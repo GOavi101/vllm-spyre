@@ -12,6 +12,7 @@ async_scheduler.py:
 """
 
 import math
+import time
 from collections import deque
 from typing import Iterable, Union
 
@@ -211,6 +212,25 @@ class ChunkedPrefillSpyreMixin:
         self._scheduled_ongoing_prefill_ids: frozenset[str] = frozenset()
         self._schedule_awaiting_commit: bool = False
 
+        # Cache to avoid repeated lazy-import + isinstance calls in the hot path.
+        from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+        self._is_async: bool = isinstance(self, AsyncScheduler)
+
+        # Per-step profiling (enable with SENDNN_INFERENCE_SCHEDULER_PROFILING=1).
+        # The key metric is `inter-gap`: ~0 ms means true async overlap is
+        # happening; ~200 ms means the executor is sequential despite async mode.
+        self._prof_enabled: bool = envs_spyre.SENDNN_INFERENCE_SCHEDULER_PROFILING
+        if self._prof_enabled:
+            self._prof_n: int = 0
+            self._prof_log_every: int = 50
+            self._prof_last_t: float = 0.0        # wall time at end of last schedule()
+            self._prof_sched_ms: deque[float] = deque(maxlen=50)   # total schedule() time
+            self._prof_super_ms: deque[float] = deque(maxlen=50)   # super().schedule() time
+            self._prof_guard_ms: deque[float] = deque(maxlen=50)   # run-ahead guard time
+            self._prof_gap_ms: deque[float] = deque(maxlen=50)     # inter-schedule wall gap
+            self._prof_guard_fired: int = 0    # guard executions this log window
+            self._prof_guard_found: int = 0    # guard found ongoing prefills
+
     def update_from_output(self, scheduler_output, model_runner_output):
         # Pop snapshot (FIFO) and clear run-ahead flag when queue is empty
         scheduled_num_computed = (
@@ -227,7 +247,7 @@ class ChunkedPrefillSpyreMixin:
 
         # Handle empty output (async run-ahead)
         if not model_runner_output.req_ids:
-            if self._is_async_scheduler() and scheduler_output.num_scheduled_tokens:
+            if self._is_async and scheduler_output.num_scheduled_tokens:
                 import dataclasses
 
                 # Create empty scheduler output to match the empty model output
@@ -293,7 +313,7 @@ class ChunkedPrefillSpyreMixin:
         # With async scheduling, scheduler_output may contain requests that
         # weren't executed yet.  Filter to only pass executed requests to the
         # base scheduler.
-        if self._is_async_scheduler():
+        if self._is_async:
             filtered_num_scheduled_tokens = {
                 req_id: num_tokens
                 for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
@@ -339,6 +359,11 @@ class ChunkedPrefillSpyreMixin:
         running decode requests from the base scheduler before delegation.
         This pre-filter approach applies to both sync and async modes.
         """
+        if self._prof_enabled:
+            _t_sched_start = time.perf_counter()
+            if self._prof_last_t:
+                self._prof_gap_ms.append((_t_sched_start - self._prof_last_t) * 1000)
+
         # First purge the full waiting queue into our holdback queue, preserving
         # priority, so that the base scheduler does not see them.
         holdback_queue: deque[Request] = deque()
@@ -352,15 +377,28 @@ class ChunkedPrefillSpyreMixin:
             holdback_queue.append(self.skipped_waiting.pop_request())  # type: ignore[attr-defined]
 
         # Restore ongoing_prefills from snapshot to prevent async run-ahead from
-        # scheduling over in-progress prefills
-        if self._is_async_scheduler() and self._schedule_awaiting_commit:
+        # scheduling over in-progress prefills.
+        # Optimization: skip scanning self.running when no prefills were ongoing
+        # last step (_scheduled_ongoing_prefill_ids empty → result always []).
+        if self._is_async and self._schedule_awaiting_commit:
+            if self._prof_enabled:
+                _t_guard = time.perf_counter()
             scheduled_ids = self._scheduled_ongoing_prefill_ids
-            self.ongoing_prefills = [
-                req
-                for req in self.running  # type: ignore[attr-defined]
-                if req.request_id in scheduled_ids
-                and req.num_computed_tokens < req.num_prompt_tokens
-            ]
+            if scheduled_ids:
+                self.ongoing_prefills = [
+                    req
+                    for req in self.running  # type: ignore[attr-defined]
+                    if req.request_id in scheduled_ids
+                    and req.num_computed_tokens < req.num_prompt_tokens
+                ]
+            else:
+                # Last batch was decode-only — no prefill state to restore.
+                self.ongoing_prefills = []
+            if self._prof_enabled:
+                self._prof_guard_fired += 1
+                if self.ongoing_prefills:
+                    self._prof_guard_found += 1
+                self._prof_guard_ms.append((time.perf_counter() - _t_guard) * 1000)
 
         # Schedule new requests (one prefill at a time in sync mode)
         num_added_to_waiting = 0
@@ -469,7 +507,11 @@ class ChunkedPrefillSpyreMixin:
         self._schedule_awaiting_commit = True
 
         # delegate to the next class in MRO (Scheduler or AsyncScheduler)
+        if self._prof_enabled:
+            _t_super = time.perf_counter()
         outputs = super().schedule()  # type: ignore[misc]
+        if self._prof_enabled:
+            self._prof_super_ms.append((time.perf_counter() - _t_super) * 1000)
 
         # restore holdbacks after running the base scheduler
         self.running = self.running + running_holdback
@@ -491,6 +533,34 @@ class ChunkedPrefillSpyreMixin:
         # TODO: Implement sample_tokens() in SpyreModelRunner to enable async grammar
         # collection for better performance.
         outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
+
+        if self._prof_enabled:
+            _t_end = time.perf_counter()
+            self._prof_last_t = _t_end
+            self._prof_n += 1
+            self._prof_sched_ms.append((_t_end - _t_sched_start) * 1000)
+            if self._prof_n % self._prof_log_every == 0:
+                def _ms(d: deque) -> str:
+                    return (
+                        f"avg={sum(d)/len(d):.3f} min={min(d):.3f} max={max(d):.3f}"
+                        if d else "n/a"
+                    )
+                logger.info(
+                    "[sched-profile n=%d async=%s] "
+                    "schedule=%s ms  super=%s ms  guard=%s ms "
+                    "(fired=%d found=%d)  inter-gap=%s ms",
+                    self._prof_n,
+                    self._is_async,
+                    _ms(self._prof_sched_ms),
+                    _ms(self._prof_super_ms),
+                    _ms(self._prof_guard_ms),
+                    self._prof_guard_fired,
+                    self._prof_guard_found,
+                    _ms(self._prof_gap_ms),
+                )
+                self._prof_guard_fired = 0
+                self._prof_guard_found = 0
+
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:

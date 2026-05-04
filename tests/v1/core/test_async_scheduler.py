@@ -122,6 +122,11 @@ def _set_chunked_prefill_attrs(scheduler, chunk_size=128):
     # Tests that simulate the run-ahead scenario (e.g. speculative completion)
     # need this True so the guard can fire and restore ongoing_prefills.
     scheduler._schedule_awaiting_commit = True
+    # Cached isinstance result (avoids repeated lazy-import in the hot path)
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    scheduler._is_async = isinstance(scheduler, AsyncScheduler)
+    # Profiling disabled in tests
+    scheduler._prof_enabled = False
     # skipped_waiting holds grammar-blocked requests in the base vLLM Scheduler
     scheduler.skipped_waiting = FCFSRequestQueue()
 

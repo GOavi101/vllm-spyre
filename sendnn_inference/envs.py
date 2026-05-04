@@ -128,6 +128,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SENDNN_INFERENCE_CP_INTERLEAVE_STEPS": lambda: bool(
         int(os.getenv("SENDNN_INFERENCE_CP_INTERLEAVE_STEPS", "1"))
     ),
+    # Enable per-step scheduler profiling. When set to 1, ChunkedPrefillSpyreMixin
+    # logs per-phase timing every 50 schedule() calls:
+    #   - Total schedule() duration
+    #   - super().schedule() duration (base vLLM scheduler)
+    #   - Run-ahead guard duration and hit rate
+    #   - Inter-schedule wall-clock gap
+    # The inter-schedule gap is the key diagnostic: ~0 ms means true async overlap
+    # is occurring; ~200 ms means the executor is running synchronously despite
+    # async mode, and pipelining provides no benefit.
+    "SENDNN_INFERENCE_SCHEDULER_PROFILING": lambda: bool(
+        int(os.getenv("SENDNN_INFERENCE_SCHEDULER_PROFILING", "0"))
+    ),
     # If set, raises a runtime error if the model configuration is not found
     # in the known configurations registry. Only applies when running on
     # Spyre device (sendnn backend).
