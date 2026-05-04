@@ -230,6 +230,12 @@ class ChunkedPrefillSpyreMixin:
             self._prof_gap_ms: deque[float] = deque(maxlen=50)     # inter-schedule wall gap
             self._prof_guard_fired: int = 0    # guard executions this log window
             self._prof_guard_found: int = 0    # guard found ongoing prefills
+            # Per-iteration decision counters
+            self._prof_step_prefill: int = 0      # iters that scheduled a prefill chunk
+            self._prof_step_decode: int = 0       # iters that scheduled decode batch
+            self._prof_step_empty: int = 0        # iters that scheduled nothing
+            self._prof_decode_batch_sizes: deque[int] = deque(maxlen=50)
+            self._prof_prefill_chunk_sizes: deque[int] = deque(maxlen=50)
 
     def update_from_output(self, scheduler_output, model_runner_output):
         # Pop snapshot (FIFO) and clear run-ahead flag when queue is empty
@@ -539,16 +545,38 @@ class ChunkedPrefillSpyreMixin:
             self._prof_last_t = _t_end
             self._prof_n += 1
             self._prof_sched_ms.append((_t_end - _t_sched_start) * 1000)
+
+            # Classify this scheduling decision
+            num_sched = len(outputs.num_scheduled_tokens)
+            if num_sched == 0:
+                self._prof_step_empty += 1
+            else:
+                # Prefill chunk: any single request with > 1 token scheduled
+                _max_tokens = max(outputs.num_scheduled_tokens.values())
+                if _max_tokens > 1:
+                    self._prof_step_prefill += 1
+                    self._prof_prefill_chunk_sizes.append(_max_tokens)
+                else:
+                    self._prof_step_decode += 1
+                    self._prof_decode_batch_sizes.append(num_sched)
+
             if self._prof_n % self._prof_log_every == 0:
                 def _ms(d: deque) -> str:
                     return (
                         f"avg={sum(d)/len(d):.3f} min={min(d):.3f} max={max(d):.3f}"
                         if d else "n/a"
                     )
+                def _stats(d: deque) -> str:
+                    return (
+                        f"avg={sum(d)/len(d):.1f} min={min(d)} max={max(d)}"
+                        if d else "n/a"
+                    )
                 logger.info(
                     "[sched-profile n=%d async=%s] "
                     "schedule=%s ms  super=%s ms  guard=%s ms "
-                    "(fired=%d found=%d)  inter-gap=%s ms",
+                    "(fired=%d found=%d)  inter-gap=%s ms | "
+                    "steps: prefill=%d decode=%d empty=%d | "
+                    "decode_batch={%s} prefill_chunk={%s}",
                     self._prof_n,
                     self._is_async,
                     _ms(self._prof_sched_ms),
@@ -557,9 +585,17 @@ class ChunkedPrefillSpyreMixin:
                     self._prof_guard_fired,
                     self._prof_guard_found,
                     _ms(self._prof_gap_ms),
+                    self._prof_step_prefill,
+                    self._prof_step_decode,
+                    self._prof_step_empty,
+                    _stats(self._prof_decode_batch_sizes),
+                    _stats(self._prof_prefill_chunk_sizes),
                 )
                 self._prof_guard_fired = 0
                 self._prof_guard_found = 0
+                self._prof_step_prefill = 0
+                self._prof_step_decode = 0
+                self._prof_step_empty = 0
 
         return outputs
 
