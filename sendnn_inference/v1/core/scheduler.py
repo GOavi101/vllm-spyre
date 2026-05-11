@@ -8,7 +8,9 @@ This module provides Spyre-specific scheduler subclasses of vLLM's
 """
 
 import math
+import os
 from collections import deque
+from contextlib import nullcontext
 from typing import Any, Iterable, Union, cast
 
 from vllm.logger import init_logger
@@ -22,6 +24,27 @@ from sendnn_inference.platform import SpyrePlatform
 from sendnn_inference.v1.worker.spyre_model_runner import SpyreModelRunnerOutput
 
 logger = init_logger(__name__)
+
+
+def _profile_chunked_prefill_schedule() -> bool:
+    """When true, ``ChunkedPrefillSpyreScheduler.schedule`` is wrapped for torch.profiler.
+
+    Set ``SPYRE_PROFILE_SCHEDULER=1`` (or ``true`` / ``yes``) while running
+    ``scripts/profile_llm_torch.py`` (or any torch.profiler session) so Chrome /
+    Perfetto traces show a distinct span for Spyre's chunked-prefill scheduling
+    work vs. ``super().schedule()`` and grammar.
+    """
+    return os.environ.get("SPYRE_PROFILE_SCHEDULER", "").lower() in ("1", "true", "yes")
+
+
+def _torch_record_optional(name: str):
+    """Nested ``record_function`` regions when ``SPYRE_PROFILE_SCHEDULER`` is set."""
+    if not _profile_chunked_prefill_schedule():
+        return nullcontext()
+    import torch
+
+    return torch.profiler.record_function(name)
+
 
 # Ensure that block_size is 64
 # This ensures the rounding function is correct
@@ -424,6 +447,14 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
         running decode requests from the base scheduler before delegation.
         This pre-filter approach applies to both sync and async modes.
         """
+        if _profile_chunked_prefill_schedule():
+            import torch
+
+            with torch.profiler.record_function("ChunkedPrefillSpyreScheduler.schedule"):
+                return self._schedule_chunked_prefill_impl()
+        return self._schedule_chunked_prefill_impl()
+
+    def _schedule_chunked_prefill_impl(self) -> "SchedulerOutput":
         # First purge the full waiting queue into our holdback queue, preserving
         # priority, so that the base scheduler does not see them.
         holdback_queue: deque[Request] = deque()
@@ -547,7 +578,8 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
         # optimistic num_computed_tokens advance happens in
         # update_from_output() via num_output_placeholders rather than via a
         # snapshot deque maintained here.
-        outputs = super().schedule()
+        with _torch_record_optional("vllm.Scheduler.schedule"):
+            outputs = super().schedule()
 
         # restore holdbacks after running the base scheduler
         self.running = self.running + running_holdback
@@ -568,7 +600,8 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
         # asynchronously while the model is running (as done in vLLM core).
         # TODO: Implement sample_tokens() in SpyreModelRunner to enable async grammar
         # collection for better performance.
-        cast(Any, outputs)._spyre_grammar_output = self.get_grammar_bitmask(outputs)
+        with _torch_record_optional("spy.get_grammar_bitmask"):
+            cast(Any, outputs)._spyre_grammar_output = self.get_grammar_bitmask(outputs)
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:
