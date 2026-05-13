@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     SENDNN_INFERENCE_WARMUP_BATCH_SIZES: list[int] | None = None
     SENDNN_INFERENCE_PERF_METRIC_LOGGING_ENABLED: int = 0
     SENDNN_INFERENCE_PERF_METRIC_LOGGING_DIR: str = "/tmp"
+    SENDNN_INFERENCE_OVERLAP_TRACE_PATH: str = ""
     SENDNN_INFERENCE_OVERRIDE_SIGNALS_HANDLER: bool = False
     SENDNN_INFERENCE_CP_INTERLEAVE_STEPS: bool = True
     SENDNN_INFERENCE_UPDATE_THREAD_CONFIG: bool = True
@@ -82,6 +83,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logs are written to /tmp.
     "SENDNN_INFERENCE_PERF_METRIC_LOGGING_DIR": lambda: os.getenv(
         "SENDNN_INFERENCE_PERF_METRIC_LOGGING_DIR", "/tmp"
+    ),
+    # When set to a writable file path, engine and worker append JSON lines
+    # (``sendnn_inference.perf.overlap_trace``) to measure whether scheduler
+    # work overlaps in-flight worker forwards. Used by profiling scripts; empty
+    # means disabled.
+    "SENDNN_INFERENCE_OVERLAP_TRACE_PATH": lambda: os.getenv(
+        "SENDNN_INFERENCE_OVERLAP_TRACE_PATH", ""
     ),
     # If set, override the signal handler for sendnn-inference on
     # vLLM V1 + torch_sendnn backend to be able to gracefully

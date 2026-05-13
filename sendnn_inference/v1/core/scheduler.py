@@ -9,6 +9,7 @@ This module provides Spyre-specific scheduler subclasses of vLLM's
 
 import math
 import os
+import time
 from collections import deque
 from contextlib import nullcontext
 from typing import Any, Iterable, Union, cast
@@ -20,6 +21,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus
 
 import sendnn_inference.envs as envs_spyre
+from sendnn_inference.perf.overlap_trace import emit as _overlap_emit
 from sendnn_inference.platform import SpyrePlatform
 from sendnn_inference.v1.worker.spyre_model_runner import SpyreModelRunnerOutput
 
@@ -447,12 +449,27 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
         running decode requests from the base scheduler before delegation.
         This pre-filter approach applies to both sync and async modes.
         """
-        if _profile_chunked_prefill_schedule():
-            import torch
+        _sched_t0 = time.time_ns()
+        _overlap_emit("engine.spy_schedule_begin")
+        _out: list[SchedulerOutput] = []
+        try:
+            if _profile_chunked_prefill_schedule():
+                import torch
 
-            with torch.profiler.record_function("ChunkedPrefillSpyreScheduler.schedule"):
-                return self._schedule_chunked_prefill_impl()
-        return self._schedule_chunked_prefill_impl()
+                with torch.profiler.record_function("ChunkedPrefillSpyreScheduler.schedule"):
+                    _out.append(self._schedule_chunked_prefill_impl())
+            else:
+                _out.append(self._schedule_chunked_prefill_impl())
+            return _out[0]
+        finally:
+            _o = _out[0] if _out else None
+            _overlap_emit(
+                "engine.spy_schedule_end",
+                dur_ns=time.time_ns() - _sched_t0,
+                total_scheduled_tokens=(
+                    _o.total_num_scheduled_tokens if _o is not None else -1
+                ),
+            )
 
     def _schedule_chunked_prefill_impl(self) -> "SchedulerOutput":
         # First purge the full waiting queue into our holdback queue, preserving

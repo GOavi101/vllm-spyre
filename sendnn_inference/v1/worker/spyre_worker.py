@@ -32,6 +32,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 import sendnn_inference.envs as envs_spyre
 import sendnn_inference.perf_metrics as perf_metrics
 import sendnn_inference.utils as utils_spyre
+from sendnn_inference.perf.overlap_trace import emit as _overlap_emit
 from sendnn_inference.model_executor.model_loader import spyre_setup
 from sendnn_inference.platform import SpyrePlatform
 from sendnn_inference.v1.worker.spyre_model_runner import (
@@ -780,16 +781,31 @@ class SpyreWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        if self.profiler is not None:
-            self.profiler.step()
-        output = self.model_runner.execute_model(scheduler_output)
-        # Pass ``None`` through so the engine knows to call ``sample_tokens``
-        # next (sampling-mode runners defer the sample step). When the runner
-        # already produced a concrete output (empty / pooling / incomplete
-        # prefill paths) we return it directly on the driver worker only.
-        if output is None:
-            return None
-        return output if self.is_driver_worker else None
+        ntok = scheduler_output.total_num_scheduled_tokens
+        _overlap_emit(
+            "worker.execute_model_begin",
+            rank=self.rank,
+            local_rank=self.local_rank,
+            scheduled_tokens=ntok,
+        )
+        try:
+            if self.profiler is not None:
+                self.profiler.step()
+            output = self.model_runner.execute_model(scheduler_output)
+            # Pass ``None`` through so the engine knows to call ``sample_tokens``
+            # next (sampling-mode runners defer the sample step). When the runner
+            # already produced a concrete output (empty / pooling / incomplete
+            # prefill paths) we return it directly on the driver worker only.
+            if output is None:
+                return None
+            return output if self.is_driver_worker else None
+        finally:
+            _overlap_emit(
+                "worker.execute_model_end",
+                rank=self.rank,
+                local_rank=self.local_rank,
+                scheduled_tokens=ntok,
+            )
 
     def _execute_and_sample(
         self,
