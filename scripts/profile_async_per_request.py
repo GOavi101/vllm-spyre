@@ -33,16 +33,23 @@ Requirements
 this script picks a **free local port** each run (unless you pass ``--master-port``).
 Unset a stale ``MASTER_PORT`` in your shell or reuse the script default.
 
-Example::
+Example (TP=1, eager CPU — no overlap expected)::
 
     export SENDNN_INFERENCE_DYNAMO_BACKEND=eager
     python scripts/profile_async_per_request.py \\
         --model ibm-granite/granite-3.3-8b-instruct \\
-        --batch-queue-size 2 \\
         --num-prompts 4 \\
-        --output-dir /tmp/async_req_prof \\
-        --vllm-torch-profiler \\
-        --profile-prefix myrun
+        --output-dir /tmp/async_tp1
+
+Example (TP=4, Spyre hardware — true overlap via MultiprocExecutor)::
+
+    python scripts/profile_async_per_request.py \\
+        --model ibm-granite/granite-3.3-8b-instruct \\
+        --tensor-parallel-size 4 \\
+        --num-prompts 4 \\
+        --max-tokens 16 \\
+        --output-dir /tmp/async_tp4 \\
+        --vllm-torch-profiler
 
 Outputs under ``--output-dir``::
 
@@ -91,17 +98,19 @@ def _engine_args_param_names() -> set[str]:
         return set()
 
 
-def _apply_async_engine_kwargs(kwargs: dict, args: argparse.Namespace) -> None:
-    """Only pass ``async_scheduling`` / ``batch_queue_size`` if this vLLM supports them."""
+def _apply_engine_scheduler_kwargs(kwargs: dict, args: argparse.Namespace) -> None:
+    """Pass ``async_scheduling`` / ``batch_queue_size`` when EngineArgs supports them."""
     names = _engine_args_param_names()
     if "async_scheduling" in names:
-        kwargs["async_scheduling"] = True
-    else:
+        kwargs["async_scheduling"] = not args.sync
+    elif not args.sync:
         print(
             "Warning: EngineArgs has no 'async_scheduling' — running with default scheduling "
             "(upgrade vLLM for async_scheduling + batch_queue_size).",
             file=sys.stderr,
         )
+    if args.sync:
+        return
     if "batch_queue_size" in names:
         kwargs["batch_queue_size"] = args.batch_queue_size
     else:
@@ -141,8 +150,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=512)
     p.add_argument("--max-num-seqs", type=int, default=4)
     p.add_argument("--max-num-batched-tokens", type=int, default=128)
-    p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     p.add_argument("--dynamo-backend", type=str, default=os.environ.get("SENDNN_INFERENCE_DYNAMO_BACKEND", "eager"))
+    p.add_argument(
+        "--sync",
+        action="store_true",
+        help="Synchronous scheduling (async_scheduling=False; skips batch_queue_size).",
+    )
+    p.add_argument(
+        "--no-multiproc",
+        action="store_true",
+        help="Force VLLM_ENABLE_V1_MULTIPROCESSING=0 (TP>1 normally enables it).",
+    )
     p.add_argument(
         "--batch-queue-size",
         type=int,
@@ -220,7 +239,7 @@ def _llm_kwargs(args: argparse.Namespace, output_dir: Path) -> dict:
         "enable_prefix_caching": False,
         "disable_log_stats": False,
     }
-    _apply_async_engine_kwargs(kwargs, args)
+    _apply_engine_scheduler_kwargs(kwargs, args)
 
     if args.vllm_torch_profiler:
         try:
@@ -424,6 +443,37 @@ def _print_table(rows: list[dict], max_width: int) -> None:
         print(line)
 
 
+def _print_config_summary(args: argparse.Namespace) -> None:
+    """Print a banner so it's obvious what configuration is being tested."""
+    tp = args.tensor_parallel_size
+    multiproc = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    backend = args.dynamo_backend
+    executor = "MultiprocExecutor" if (tp > 1 or multiproc == "1") else "UniProcExecutor"
+    overlap_expected = executor == "MultiprocExecutor"
+
+    print("\n" + "=" * 72)
+    print("Configuration")
+    print("=" * 72)
+    print(f"  model:               {args.model}")
+    print(f"  tensor_parallel_size: {tp}")
+    print(f"  dynamo_backend:      {backend}")
+    print(f"  executor (expected): {executor}")
+    print(f"  multiprocessing:     VLLM_ENABLE_V1_MULTIPROCESSING={multiproc}")
+    print(f"  async_scheduling:    {not args.sync}")
+    print(f"  batch_queue_size:    {args.batch_queue_size} (if EngineArgs supports it)")
+    print(f"  max_model_len:       {args.max_model_len}")
+    print(f"  max_num_seqs:        {args.max_num_seqs}")
+    print(f"  num_prompts:         {args.num_prompts}")
+    print(f"  max_tokens:          {args.max_tokens}")
+    if overlap_expected:
+        print("  --> MultiprocExecutor: worker runs in separate process.")
+        print("      Overlap between schedule() and execute_model() IS possible.")
+    else:
+        print("  --> UniProcExecutor: everything on one thread.")
+        print("      Overlap NOT possible. Use --tensor-parallel-size >1 for overlap.")
+    print("=" * 72 + "\n")
+
+
 def main() -> int:
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -435,6 +485,13 @@ def main() -> int:
     os.environ["SENDNN_INFERENCE_DYNAMO_BACKEND"] = args.dynamo_backend
     os.environ["SENDNN_INFERENCE_PERF_METRIC_LOGGING_ENABLED"] = "1"
     os.environ["SENDNN_INFERENCE_PERF_METRIC_LOGGING_DIR"] = str(output_dir)
+
+    if args.no_multiproc:
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    elif args.tensor_parallel_size > 1:
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+
+    _print_config_summary(args)
 
     overlap_path: Path | None = None
     if not args.no_overlap_trace:

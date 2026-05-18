@@ -472,6 +472,12 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
             )
 
     def _schedule_chunked_prefill_impl(self) -> "SchedulerOutput":
+        from sendnn_inference.perf.queue_trace import emit_chunked_prefill_snapshot
+
+        step = getattr(self, "_queue_trace_step", 0)
+        self._queue_trace_step = step + 1
+        emit_chunked_prefill_snapshot("schedule_entry", self, step=step)
+
         # First purge the full waiting queue into our holdback queue, preserving
         # priority, so that the base scheduler does not see them.
         holdback_queue: deque[Request] = deque()
@@ -590,6 +596,14 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
             self.previous_step_was_prefill = False
             running_holdback = []
 
+        emit_chunked_prefill_snapshot(
+            "pre_delegate",
+            self,
+            step=step,
+            holdback_len=len(holdback_queue),
+            running_holdback_len=len(running_holdback),
+        )
+
         # delegate to the base scheduler.  In the async variant this resolves
         # to AsyncScheduler.schedule() via the MRO. Reconciliation of the
         # optimistic num_computed_tokens advance happens in
@@ -602,6 +616,15 @@ class ChunkedPrefillSpyreScheduler(Scheduler):
         self.running = self.running + running_holdback
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
+
+        emit_chunked_prefill_snapshot(
+            "schedule_end",
+            self,
+            step=step,
+            holdback_len=len(holdback_queue),
+            running_holdback_len=0,
+            outputs=outputs,
+        )
 
         # Log the scheduled tokens not at every step, but when doing chunked
         # prefill. These include decode steps during interleaving
